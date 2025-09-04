@@ -130,6 +130,86 @@ class XTDeviceFunction:
         )
 
 
+class LocalStrategyItemDict(dict):
+    """Dictionary for a single local strategy entry that invalidates caches on change."""
+
+    def __init__(self, parent: LocalStrategyDict, *args, **kwargs):  # type: ignore # noqa: F821
+        super().__init__(*args, **kwargs)
+        self.parent = parent
+
+    def _invalidate(self) -> None:
+        # Inform the device that caches are now stale
+        self.parent.device._invalidate_local_strategy_cache()
+
+    # Override mutating methods
+    def __setitem__(self, key, value) -> None:  # type: ignore[override]
+        super().__setitem__(key, value)
+        self._invalidate()
+
+    def __delitem__(self, key) -> None:  # type: ignore[override]
+        super().__delitem__(key)
+        self._invalidate()
+
+    def clear(self) -> None:  # type: ignore[override]
+        super().clear()
+        self._invalidate()
+
+    def update(self, *args, **kwargs) -> None:  # type: ignore[override]
+        super().update(*args, **kwargs)
+        self._invalidate()
+
+    def pop(self, *args, **kwargs):  # type: ignore[override]
+        result = super().pop(*args, **kwargs)
+        self._invalidate()
+        return result
+
+    def popitem(self):  # type: ignore[override]
+        result = super().popitem()
+        self._invalidate()
+        return result
+
+
+class LocalStrategyDict(dict):
+    """Dictionary wrapper that keeps a device cache in sync."""
+
+    def __init__(self, device: XTDevice, *args, **kwargs):  # type: ignore # noqa: F821
+        super().__init__()
+        self.device = device
+        self.update(dict(*args, **kwargs))
+
+    def _wrap_value(self, value):
+        if isinstance(value, dict) and not isinstance(value, LocalStrategyItemDict):
+            return LocalStrategyItemDict(self, value)
+        return value
+
+    def __setitem__(self, key, value) -> None:  # type: ignore[override]
+        super().__setitem__(key, self._wrap_value(value))
+        self.device._invalidate_local_strategy_cache()
+
+    def __delitem__(self, key) -> None:  # type: ignore[override]
+        super().__delitem__(key)
+        self.device._invalidate_local_strategy_cache()
+
+    def clear(self) -> None:  # type: ignore[override]
+        super().clear()
+        self.device._invalidate_local_strategy_cache()
+
+    def update(self, *args, **kwargs) -> None:  # type: ignore[override]
+        for k, v in dict(*args, **kwargs).items():
+            super().__setitem__(k, self._wrap_value(v))
+        self.device._invalidate_local_strategy_cache()
+
+    def pop(self, *args, **kwargs):  # type: ignore[override]
+        result = super().pop(*args, **kwargs)
+        self.device._invalidate_local_strategy_cache()
+        return result
+
+    def popitem(self):  # type: ignore[override]
+        result = super().popitem()
+        self.device._invalidate_local_strategy_cache()
+        return result
+
+
 class XTDevice(TuyaDevice):
     id: str
     name: str
@@ -149,7 +229,11 @@ class XTDevice(TuyaDevice):
     update_time: int
     set_up: Optional[bool] = False
     support_local: Optional[bool] = False
+    # Local strategy mapping, wrapped to invalidate caches on modifications
     local_strategy: dict[int, dict[str, Any]] = {}
+    # Cached lookups for quick code/dpId translations
+    code_to_dpid: dict[str, int]
+    dpid_to_code: dict[int, str]
     source: str
     online_states: dict[str, bool]
     data_model: dict[str, Any]
@@ -170,6 +254,11 @@ class XTDevice(TuyaDevice):
         "device_source_priority",
         "original_device",
         "source",
+        "code_to_dpid",
+        "dpid_to_code",
+        "_local_strategy",
+        "_local_strategy_version",
+        "_local_strategy_cache_version",
     ]
 
     class XTDevicePreference(StrEnum):
@@ -205,6 +294,10 @@ class XTDevice(TuyaDevice):
         self.set_up: bool | None = False
         self.support_local: bool | None = False
 
+        self._local_strategy_version = 0
+        self._local_strategy_cache_version = -1
+        self.code_to_dpid = {}
+        self.dpid_to_code = {}
         self.local_strategy = {}
         self.status = {}
         self.function = {}  # type: ignore
@@ -229,6 +322,33 @@ class XTDevice(TuyaDevice):
 
         return f"Device {self.name}:\r\n{function_str}{status_range_str}{status_str}{local_strategy_str}"
         # return f"Device {self.name}:\r\n{self.source}"
+
+    @property
+    def local_strategy(self) -> LocalStrategyDict:  # type: ignore[override]
+        return self._local_strategy
+
+    @local_strategy.setter
+    def local_strategy(self, value: dict[int, dict[str, Any]] | LocalStrategyDict):  # type: ignore[override]
+        if not isinstance(value, LocalStrategyDict):
+            value = LocalStrategyDict(self, value)
+        self._local_strategy = value
+        self._invalidate_local_strategy_cache()
+        self._refresh_local_strategy_cache()
+
+    def _invalidate_local_strategy_cache(self) -> None:
+        self._local_strategy_version += 1
+
+    def _refresh_local_strategy_cache(self) -> None:
+        self.code_to_dpid = {}
+        self.dpid_to_code = {}
+        for dp_id, item in self.local_strategy.items():
+            code = item.get("status_code")
+            if code:
+                self.dpid_to_code[dp_id] = code
+                self.code_to_dpid[code] = dp_id
+                for alias in item.get("status_code_alias", []):
+                    self.code_to_dpid[alias] = dp_id
+        self._local_strategy_cache_version = self._local_strategy_version
     
     def set_device_map(self, device_map: XTDeviceMap):
         self.device_map = device_map
