@@ -5,9 +5,14 @@ import logging
 import asyncio
 from typing import Any
 from datetime import datetime
-from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.config_entries import (
+    ConfigEntry,
+    ConfigEntryState,
+    SIGNAL_CONFIG_ENTRY_CHANGED,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from .const import (
     DOMAIN,
     DOMAIN_ORIG,
@@ -139,17 +144,47 @@ async def cleanup_duplicated_devices(
                     break
 
 
+async def wait_for_domain_entries_loaded(
+    hass: HomeAssistant,
+    domain: str,
+    current_entry: ConfigEntry | None,
+    timeout: float = 30.0,
+) -> bool:
+    """Wait until all config entries for a domain are loaded."""
+    if are_all_domain_config_loaded(hass, domain, current_entry):
+        return True
+
+    event = asyncio.Event()
+
+    def _entry_changed(change_type: Any, entry: ConfigEntry) -> None:
+        if entry.domain != domain:
+            return
+        if are_all_domain_config_loaded(hass, domain, current_entry):
+            event.set()
+
+    unsub = async_dispatcher_connect(
+        hass, SIGNAL_CONFIG_ENTRY_CHANGED, _entry_changed
+    )
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout)
+        return True
+    except asyncio.TimeoutError:
+        LOGGER.warning("Timeout waiting for %s config entries to load", domain)
+        return False
+    finally:
+        unsub()
+
+
 async def cleanup_device_registry(
     hass: HomeAssistant, multi_manager: MultiManager, current_entry: ConfigEntry
 ) -> None:
     """Remove deleted device registry entry if there are no remaining entities."""
-    while not are_all_domain_config_loaded(hass, DOMAIN_ORIG, None):
-        await asyncio.sleep(1)
-    while not are_all_domain_config_loaded(hass, DOMAIN, current_entry):
-        if is_config_entry_master(hass, DOMAIN, current_entry):
-            await asyncio.sleep(0.1)
-        else:
+    await wait_for_domain_entries_loaded(hass, DOMAIN_ORIG, None)
+    if not are_all_domain_config_loaded(hass, DOMAIN, current_entry):
+        if not is_config_entry_master(hass, DOMAIN, current_entry):
             return
+        await wait_for_domain_entries_loaded(hass, DOMAIN, current_entry)
     device_registry = dr.async_get(hass)
     for dev_id, device_entry in list(device_registry.devices.items()):
         for item in device_entry.identifiers:
