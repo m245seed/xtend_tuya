@@ -53,7 +53,7 @@ class HomeAssistantXTData(NamedTuple):
         return self.multi_manager
 
 
-type XTConfigEntry = ConfigEntry[HomeAssistantXTData]
+XTConfigEntry = ConfigEntry[HomeAssistantXTData]
 
 
 @dataclass
