@@ -1,5 +1,5 @@
 from __future__ import annotations
-from threading import Thread
+from threading import Thread, Lock
 
 class XTThread(Thread):
     def __init__(self, callable, immediate_start: bool = False, *args, **kwargs):
@@ -26,42 +26,56 @@ class XTThreadingManager:
         self.thread_active_list: list[XTThread] = []
         self.thread_finished_list: list[XTThread] = []
         self.max_concurrency: int | None = None
+        self._lock = Lock()
 
     def add_thread(self, callable, immediate_start: bool = False, *args, **kwargs):
-        thread = XTThread(callable=callable, *args, **kwargs)
-        self.thread_queue.append(thread)
+        thread = XTThread(callable, *args, **kwargs)
+        with self._lock:
+            self.thread_queue.append(thread)
         if immediate_start:
             thread.start()
 
     def start_all_threads(self, max_concurrency: int | None = None) -> None:
         self.max_concurrency = max_concurrency
-        while (
-            max_concurrency is None or len(self.thread_active_list) < max_concurrency
-        ) and len(self.thread_queue) > 0:
-            added_thread = self.thread_queue.pop(0)
+        while True:
+            with self._lock:
+                if len(self.thread_queue) == 0 or (
+                    max_concurrency is not None
+                    and len(self.thread_active_list) >= max_concurrency
+                ):
+                    break
+                added_thread = self.thread_queue.pop(0)
+                self.thread_active_list.append(added_thread)
             added_thread.start()
-            self.thread_active_list.append(added_thread)
 
     def start_and_wait(self, max_concurrency: int | None = None) -> None:
         self.start_all_threads(max_concurrency)
         self.wait_for_all_threads()
 
     def clean_finished_threads(self):
-        thread_active_list = self.thread_active_list
         at_least_one_thread_removed: bool = False
-        for thread in thread_active_list:
+        with self._lock:
+            active_copy = list(self.thread_active_list)
+        for thread in active_copy:
             if thread.is_alive() is False:
                 thread.join()
-                self.thread_active_list.remove(thread)
-                self.thread_finished_list.append(thread)
-                at_least_one_thread_removed = True
+                with self._lock:
+                    if thread in self.thread_active_list:
+                        self.thread_active_list.remove(thread)
+                        self.thread_finished_list.append(thread)
+                        at_least_one_thread_removed = True
         if at_least_one_thread_removed:
             self.start_all_threads(max_concurrency=self.max_concurrency)
 
     def wait_for_all_threads(self) -> None:
-        while len(self.thread_active_list) > 0:
+        while True:
             self.clean_finished_threads()
-            if len(self.thread_active_list) > 0:
-                self.thread_active_list[0].join(timeout=self.join_timeout)
-        for thread in self.thread_finished_list:
+            with self._lock:
+                if len(self.thread_active_list) == 0:
+                    break
+                thread = self.thread_active_list[0]
+            thread.join(timeout=self.join_timeout)
+        with self._lock:
+            finished_copy = list(self.thread_finished_list)
+        for thread in finished_copy:
             thread.raise_exception_if_needed()
