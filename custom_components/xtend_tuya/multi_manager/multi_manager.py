@@ -251,24 +251,21 @@ class MultiManager:  # noqa: F811
             and device.status_range[code].dp_id != 0
         ):
             return device.status_range[code].dp_id
-        for dpId in device.local_strategy:
-            if device.local_strategy[dpId]["status_code"] == code:
-                return dpId
-            if (
-                "status_code_alias" in device.local_strategy[dpId]
-                and code in device.local_strategy[dpId]["status_code_alias"]
-            ):
-                return dpId
-            elif "status_code_alias" not in device.local_strategy[dpId]:
-                LOGGER.warning(
-                    f"Device {device.name} ({device.id}) has no status_code_alias dict for dpId {dpId}, please contact the developer about this"
-                )
-        return None
+        # Ensure caches are in sync
+        if (
+            getattr(device, "_local_strategy_cache_version", 0)
+            != getattr(device, "_local_strategy_version", 0)
+        ):
+            device._refresh_local_strategy_cache()
+        return device.code_to_dpid.get(code)
 
     def _read_code_from_dpId(self, dpId: int, device: XTDevice) -> str | None:
-        if dp_id_item := device.local_strategy.get(dpId, None):
-            return dp_id_item["status_code"]
-        return None
+        if (
+            getattr(device, "_local_strategy_cache_version", 0)
+            != getattr(device, "_local_strategy_version", 0)
+        ):
+            device._refresh_local_strategy_cache()
+        return device.dpid_to_code.get(dpId)
 
     def __get_devices_from_device_id(self, device_id: str) -> list[XTDevice]:
         return_list = []
