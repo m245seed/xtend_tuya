@@ -102,46 +102,67 @@ async def async_setup_entry(hass: HomeAssistant, entry: XTConfigEntry) -> bool:
     return True
 
 
-async def cleanup_duplicated_devices(
-    hass: HomeAssistant, current_entry: ConfigEntry
-) -> None:
-    if not is_config_entry_master(hass, DOMAIN, current_entry):
-        return
-    device_registry = dr.async_get(hass)
-    entity_registry = er.async_get(hass)
+def _get_duplicate_devices(
+    device_registry: dr.DeviceRegistry,
+) -> dict[str, list[str]]:
+    """Get a dictionary of devices that have duplicates."""
     duplicate_check_table: dict[str, list] = {}
-    for hass_dev_id, device_entry in list(device_registry.devices.items()):
+    for hass_dev_id, device_entry in device_registry.devices.items():
         for item in device_entry.identifiers:
             if len(item) > 1:
-                domain = item[0]
-                device_id = item[1]
+                domain, device_id = item
                 if domain in [DOMAIN, DOMAIN_ORIG]:
                     if device_id not in duplicate_check_table:
                         duplicate_check_table[device_id] = []
                     if hass_dev_id not in duplicate_check_table[device_id]:
                         duplicate_check_table[device_id].append(hass_dev_id)
                     break
-    for device_id in duplicate_check_table:
-        remaining_devices = len(duplicate_check_table[device_id])
-        if remaining_devices > 1:
-            for hass_dev_id in duplicate_check_table[device_id]:
-                if hass_dev_id not in device_registry.devices:
-                    continue
-                if remaining_devices > 1:
-                    hass_entities = er.async_entries_for_device(
-                        entity_registry,
-                        device_id=hass_dev_id,
-                        include_disabled_entities=True,
-                    )
-                    if len(hass_entities) == 0:
-                        remaining_devices = remaining_devices - 1
-                        try:
-                            device_registry.async_remove_device(hass_dev_id)
-                        except Exception:
-                            # Discard any exception in device cleanup...
-                            pass
-                else:
-                    break
+    return duplicate_check_table
+
+
+async def cleanup_duplicated_devices(
+    hass: HomeAssistant, current_entry: ConfigEntry
+) -> None:
+    """Remove duplicated devices that have no entities."""
+    if not is_config_entry_master(hass, DOMAIN, current_entry):
+        return
+
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+
+    duplicate_devices = _get_duplicate_devices(device_registry)
+
+    for hass_device_ids in duplicate_devices.values():
+        if len(hass_device_ids) <= 1:
+            continue
+
+        devices_with_entities = []
+        devices_without_entities = []
+
+        for hass_dev_id in hass_device_ids:
+            if er.async_entries_for_device(entity_registry, hass_dev_id, True):
+                devices_with_entities.append(hass_dev_id)
+            else:
+                devices_without_entities.append(hass_dev_id)
+
+        # If there is at least one device with entities, we can remove all devices
+        # without entities.
+        if devices_with_entities:
+            for hass_dev_id in devices_without_entities:
+                try:
+                    device_registry.async_remove_device(hass_dev_id)
+                except Exception:
+                    # Ignore errors during cleanup
+                    pass
+        # If there are no devices with entities, we keep one device without entities
+        # and remove the rest.
+        else:
+            for hass_dev_id in devices_without_entities[1:]:
+                try:
+                    device_registry.async_remove_device(hass_dev_id)
+                except Exception:
+                    # Ignore errors during cleanup
+                    pass
 
 
 async def wait_for_domain_entries_loaded(

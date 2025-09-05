@@ -1,73 +1,48 @@
 from __future__ import annotations
-from functools import partial
-import copy
+
 import importlib
 import os
+from functools import partial
 from typing import Any, Literal, Optional
+
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from tuya_iot.device import (
-    PROTOCOL_DEVICE_REPORT,
-    PROTOCOL_OTHER,
-)
+
 from ..const import (
     LOGGER,
     AllowedPlugins,
     XTDeviceEntityFunctions,
     XTMultiManagerProperties,
 )
+from ..entity_parser.entity_parser import XTCustomEntityParser
+from ..util import append_lists
+from .refactor.device_merger import DeviceMerger
+from .refactor.message_handler import MessageHandler
+from .shared.cloud_fix import CloudFixes
+from .shared.debug.debug_helper import DebugHelper
+from .shared.interface.device_manager import XTDeviceManagerInterface
+from .shared.multi_device_listener import MultiDeviceListener
+from .shared.multi_mq import MultiMQTTQueue
+from .shared.multi_source_handler import MultiSourceHandler
+from .shared.multi_virtual_function_handler import XTVirtualFunctionHandler
+from .shared.multi_virtual_state_handler import XTVirtualStateHandler
 from .shared.shared_classes import (
     DeviceWatcher,
     XTConfigEntry,  # noqa: F811
-    XTDeviceMap,
     XTDevice,
+    XTDeviceMap,
 )
-from .shared.threading import (
-    XTThreadingManager,
-)
-from .shared.debug.debug_helper import (
-    DebugHelper,
-)
-from .shared.merging_manager import (
-    XTMergingManager,
-)
-from .shared.cloud_fix import (
-    CloudFixes,
-)
-from .shared.multi_source_handler import (
-    MultiSourceHandler,
-)
-from .shared.multi_mq import (
-    MultiMQTTQueue,
-)
-from .shared.multi_device_listener import (
-    MultiDeviceListener,
-)
-from .shared.multi_virtual_state_handler import (
-    XTVirtualStateHandler,
-)
-from .shared.multi_virtual_function_handler import (
-    XTVirtualFunctionHandler,
-)
-from ..util import (
-    append_lists,
-)
-from .shared.interface.device_manager import (
-    XTDeviceManagerInterface,
-)
-from ..entity_parser.entity_parser import (
-    XTCustomEntityParser,
-)
+from .shared.threading import XTThreadingManager
 
 
 class MultiManager:  # noqa: F811
+    """A manager for all Tuya managers."""
+
     def __init__(self, hass: HomeAssistant) -> None:
         self.virtual_state_handler = XTVirtualStateHandler(self)
         self.virtual_function_handler = XTVirtualFunctionHandler(self)
         self.multi_mqtt_queue: MultiMQTTQueue = MultiMQTTQueue(self)
-        self.multi_device_listener: MultiDeviceListener = MultiDeviceListener(
-            hass, self
-        )
+        self.multi_device_listener: MultiDeviceListener = MultiDeviceListener(hass, self)
         self.hass = hass
         self.multi_source_handler = MultiSourceHandler(self)
         self.device_watcher = DeviceWatcher(self)
@@ -81,6 +56,8 @@ class MultiManager:  # noqa: F811
         self.general_properties: dict[str, Any] = {}
         self.entity_parsers: dict[str, XTCustomEntityParser] = {}
         self.post_setup_callbacks: list = []
+        self.device_merger = DeviceMerger(self)
+        self.message_handler = MessageHandler(self)
 
     @property
     def device_map(self):
@@ -134,21 +111,26 @@ class MultiManager:  # noqa: F811
         return return_list
 
     def get_platform_descriptors_to_merge(self, platform: Platform) -> list:
-        return_list: list = []
-        for account in self.accounts.values():
-            if new_descriptors := account.get_platform_descriptors_to_merge(platform):
-                return_list.append(new_descriptors)
-        for entity_parser in self.entity_parsers.values():
-            if new_descriptors := entity_parser.get_descriptors_to_merge(platform):
-                return_list.append(new_descriptors)
-        return return_list
-    
+        """Get all platform descriptors to be merged."""
+        account_descriptors = [
+            desc
+            for account in self.accounts.values()
+            if (desc := account.get_platform_descriptors_to_merge(platform))
+        ]
+        parser_descriptors = [
+            desc
+            for parser in self.entity_parsers.values()
+            if (desc := parser.get_descriptors_to_merge(platform))
+        ]
+        return account_descriptors + parser_descriptors
+
     def get_platform_descriptors_to_exclude(self, platform: Platform) -> list:
-        return_list: list = []
-        for account in self.accounts.values():
-            if new_descriptors := account.get_platform_descriptors_to_exclude(platform):
-                return_list.append(new_descriptors)
-        return return_list
+        """Get all platform descriptors to be excluded."""
+        return [
+            desc
+            for account in self.accounts.values()
+            if (desc := account.get_platform_descriptors_to_exclude(platform))
+        ]
 
     def update_device_cache(self):
         self.is_ready_for_messages = False
@@ -176,7 +158,7 @@ class MultiManager:  # noqa: F811
 
         # Now let's aggregate all of these devices into a single
         # "All functionnality" device
-        self._merge_devices_from_multiple_sources()
+        self.device_merger.merge_devices()
         for device in self.device_map.values():
             # Applied twice because some parts at the end of apply_fix would change values of previous calls
             CloudFixes.apply_fixes(device)
@@ -197,31 +179,21 @@ class MultiManager:  # noqa: F811
                     if device_id not in self.master_device_map:
                         self.master_device_map[device_id] = device_map[device_id]
 
-    def __get_available_device_maps(self) -> list[XTDeviceMap]:
+    def get_available_device_maps(self) -> list[XTDeviceMap]:
         return_list: list[XTDeviceMap] = []
         for manager in self.accounts.values():
             for device_map in manager.get_available_device_maps():
                 return_list.append(device_map)
         return return_list
 
-    def _merge_devices_from_multiple_sources(self):
-        # Merge the device function, status_range and status between managers
-        for device in self.device_map.values():
-            to_be_merged: list[XTDevice] = []
-            devices = self.__get_devices_from_device_id(device.id)
-            for current_device in devices:
-                for prev_device in to_be_merged:
-                    XTMergingManager.merge_devices(prev_device, current_device, self)
-                to_be_merged.append(current_device)
-
     def _enable_multi_map_device_alignment(self):
-        for device_map in self.__get_available_device_maps():
+        for device_map in self.get_available_device_maps():
             XTDeviceMap.register_device_map(device_map)
         XTDeviceMap.register_device_map(self.device_map)
         self._align_multi_map_devices()
-    
+
     def _align_multi_map_devices(self):
-        #Refresh all master device variables with themselves to trigger alignment
+        # Refresh all master device variables with themselves to trigger alignment
         for device in self.device_map.values():
             for key, value in vars(device).items():
                 setattr(device, key, value)
@@ -267,139 +239,8 @@ class MultiManager:  # noqa: F811
             device._refresh_local_strategy_cache()
         return device.dpid_to_code.get(dpId)
 
-    def __get_devices_from_device_id(self, device_id: str) -> list[XTDevice]:
-        return_list = []
-        device_maps = self.__get_available_device_maps()
-        for device_map in device_maps:
-            if device_id in device_map:
-                return_list.append(device_map[device_id])
-        return return_list
-
-    def _read_code_dpid_value_from_state(
-        self,
-        device_id: str,
-        state,
-        fail_if_dpid_not_found=True,
-        fail_if_code_not_found=True,
-    ):
-        code = None
-        dpId = None
-        value = None
-        if "value" in state:
-            value = state["value"]
-        if device := self.device_map.get(device_id, None):
-            if code is None and "code" in state:
-                code = state["code"]
-            if dpId is None and "dpId" in state:
-                dpId = state["dpId"]
-
-            if code is None and dpId is not None:
-                code = self._read_code_from_dpId(dpId, device)
-
-            if dpId is None and code is not None:
-                dpId = self._read_dpId_from_code(code, device)
-
-            # For alias in state, replace provided code with the main code from the dpId
-            if dpId is not None:
-                code_non_alias = self._read_code_from_dpId(dpId, device)
-                if code_non_alias is not None:
-                    code = code_non_alias
-
-            if dpId is None and code is None:
-                for temp_dpId in state:
-                    temp_code = self._read_code_from_dpId(int(temp_dpId), device)
-                    if temp_code is not None:
-                        dpId = int(temp_dpId)
-                        code = temp_code
-                        value = state[temp_dpId]
-
-            if code is not None and dpId is not None:
-                return code, dpId, value, True
-        if code is None and fail_if_code_not_found:
-            if device:
-                # LOGGER.warning(f"_read_code_value_from_state FAILED => {device.id} <=> {device.name} <=> {state} <=> {device.local_strategy}")
-                pass
-            return None, None, None, False
-        if dpId is None and fail_if_dpid_not_found:
-            if device:
-                # LOGGER.warning(f"_read_code_value_from_state FAILED => {device.id} <=> {device.name} <=> {state} <=> {device.local_strategy}")
-                pass
-            return None, None, None, False
-        return code, dpId, value, True
-
-    def convert_device_report_status_list(
-        self, device_id: str, status_in: list
-    ) -> list[dict[str, Any]]:
-        status = copy.deepcopy(status_in)
-        for item in status:
-            code, dpId, value, result_ok = self._read_code_dpid_value_from_state(
-                device_id, item
-            )
-            if result_ok:
-                item["code"] = code
-                item["dpId"] = dpId
-                item["value"] = value
-            else:
-                # LOGGER.warning(f"convert_device_report_status_list code retrieval failed => {item} <=>{device_id}")
-                pass
-        return status
-
     def on_message(self, source: str, msg: dict):
-        if not self.is_ready_for_messages:
-            self.pending_messages.append((source, msg))
-            return
-        dev_id = self._get_device_id_from_message(msg)
-        if not dev_id:
-            LOGGER.warning(f"dev_id {dev_id} not found!")
-            return
-
-        new_message = self._convert_message_for_all_accounts(msg)
-        self.device_watcher.report_message(
-            dev_id, f"on_message ({source}) => {msg} <=> {new_message}"
-        )
-        if status_list := self._get_status_list_from_message(msg):
-            self.device_watcher.report_message(
-                dev_id, f"On Message reporting ({source}): {msg}"
-            )
-            self.multi_source_handler.register_status_list_from_source(
-                dev_id, source, status_list
-            )
-            # self.device_watcher.report_message(dev_id, f"on_message ({source}) status list => {status_list}")
-
-        if source in self.accounts:
-            self.accounts[source].on_message(new_message)
-
-    def _get_device_id_from_message(self, msg: dict) -> str | None:
-        protocol = msg.get("protocol", 0)
-        data = msg.get("data", {})
-        if dev_id := data.get("devId", None):
-            return dev_id
-        if protocol == PROTOCOL_OTHER:
-            if bizData := data.get("bizData", None):
-                if dev_id := bizData.get("devId", None):
-                    return dev_id
-        return None
-
-    def _get_status_list_from_message(self, msg: dict) -> str | None:
-        protocol = msg.get("protocol", 0)
-        data = msg.get("data", {})
-        if protocol == PROTOCOL_DEVICE_REPORT and "status" in data:
-            return data["status"]
-        return None
-
-    def _convert_message_for_all_accounts(self, msg: dict) -> dict:
-        protocol = msg.get("protocol", 0)
-        data = msg.get("data", {})
-        if protocol == PROTOCOL_DEVICE_REPORT:
-            return msg
-        elif protocol == PROTOCOL_OTHER:
-            if hasattr(data, "devId"):
-                return msg
-            else:
-                if bizData := data.get("bizData", None):
-                    if dev_id := bizData.get("devId", None):
-                        data["devId"] = dev_id
-        return msg
+        self.message_handler.on_message(source, msg)
 
     def query_scenes(self) -> list:
         return_list = []
