@@ -84,10 +84,9 @@ class MultiSourceHandler:
     def filter_status_list(
         self, dev_id: str, original_source: str, status_in: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        status_list = copy.deepcopy(status_in)
         device = self.multi_manager.device_map.get(dev_id, None)
         if not device:
-            return status_list
+            return list(status_in)
 
         # Only filter for devices that have a VirtualState in their status_list
         virtual_states = (
@@ -96,28 +95,23 @@ class MultiSourceHandler:
             )
         )
         if not virtual_states:
-            return status_list
+            return list(status_in)
 
-        i = 0
-        for item in status_list:
+        def _is_item_allowed(item: dict[str, Any]) -> bool:
             code, _, _, result_ok = self.multi_manager._read_code_dpid_value_from_state(
                 dev_id, item, False, True
             )
             if not result_ok or code is None:
-                continue
-
+                return True
             for virtual_state in virtual_states:
                 if code == virtual_state.key:
                     self._prepare_structure_for_code(dev_id, code)
-                    if not self._is_allowed_source_for_code(
+                    return self._is_allowed_source_for_code(
                         dev_id, code, original_source
-                    ):
-                        status_list.pop(i)
-                        i -= 1
-                        break
-            i += 1
+                    )
+            return True
 
-        return status_list
+        return [item for item in status_in if _is_item_allowed(item)]
 
     def _prepare_structure_for_code(self, dev_id: str, code: str) -> None:
         if dev_id not in self.device_map:
