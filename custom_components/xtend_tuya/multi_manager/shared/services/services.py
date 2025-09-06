@@ -14,9 +14,6 @@ from ....const import (
     MESSAGE_SOURCE_TUYA_SHARING,
     MESSAGE_SOURCE_TUYA_IOT,
 )
-from ....util import (
-    get_all_multi_managers,
-)
 from homeassistant.const import (
     CONF_DEVICE_ID,
 )
@@ -149,6 +146,8 @@ class ServiceManager:
     def _get_correct_multi_manager(
         self, source: str, device_id: str
     ) -> mm.MultiManager | None:
+        from ....util import get_all_multi_managers
+
         multi_manager_list = get_all_multi_managers(self.hass)
         for multi_manager in multi_manager_list:
             if multi_manager.device_map.get(device_id):
@@ -213,6 +212,8 @@ class ServiceManager:
     async def _handle_webrtc_debug(
         self, event: XTEventData
     ) -> web.Response | str | None:
+        from ....util import get_all_multi_managers
+
         source = event.data.get(CONF_SOURCE, MESSAGE_SOURCE_TUYA_IOT)
         session_id = event.data.get(CONF_SESSION_ID, None)
         # LOGGER.warning(f"DEBUG CALL: {event}")
