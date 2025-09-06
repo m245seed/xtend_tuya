@@ -49,6 +49,7 @@ class XTThreadingManager:
             added_thread.start()
 
     def start_and_wait(self, max_concurrency: int | None = None) -> None:
+        self.thread_finished_list = []
         self.start_all_threads(max_concurrency)
         self.wait_for_all_threads()
 

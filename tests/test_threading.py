@@ -47,3 +47,23 @@ def test_thread_exception_propagated():
 
     with pytest.raises(ValueError):
         manager.start_and_wait()
+
+
+def test_exceptions_are_cleared_between_runs():
+    manager = XTThreadingManager()
+
+    def failing_worker():
+        raise ValueError("boom")
+
+    manager.add_thread(failing_worker)
+
+    with pytest.raises(ValueError):
+        manager.start_and_wait()
+
+    def succeeding_worker():
+        pass
+
+    manager.add_thread(succeeding_worker)
+
+    # This should not raise an exception, but it will without the fix
+    manager.start_and_wait()
