@@ -523,7 +523,7 @@ class XTMergingManager:
             right_list = list(right)
             return tuple(XTMergingManager.smart_merge(left_list, right_list, msg_queue))
         elif isinstance(left, set) and isinstance(right, set):
-            return left.update(right)
+            return left | right
         elif isinstance(left, str) and isinstance(right, str):
             # Strings could be strings or represent a json subtree
             try:
